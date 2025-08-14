@@ -5,7 +5,7 @@ import sqlite3
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
-import flask
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
@@ -820,4 +820,5 @@ def main() -> None:
 if __name__ == "__main__":
 
      main()
+
 
