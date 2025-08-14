@@ -772,6 +772,11 @@ async def see_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def main() -> None:
+    """Start Flask in a thread and the bot using polling."""
+    # Start Flask server in a background thread
+    threading.Thread(target=start_flask, daemon=True).start()
+
+    
     """The main function to start the bot."""
     if not BOT_TOKEN or not ADMIN_USERID:
         logger.critical("!!! ERROR: TELEGRAM_BOT_TOKEN or ADMIN_USERID not found in .env file. !!!")
@@ -815,3 +820,4 @@ def main() -> None:
 if __name__ == "__main__":
 
      main()
+
