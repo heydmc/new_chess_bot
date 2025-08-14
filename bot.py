@@ -5,7 +5,7 @@ import sqlite3
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
-
+import flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
@@ -28,6 +28,20 @@ ADMIN_USERID = os.getenv("ADMIN_USERID")
 DB_FILE = "user_data.db"
 UPI_NUMBER = "6372833479"
 UPI_NAME = "Durgamadhav Pati"
+
+
+
+# --- FLASK APP FOR RENDER HEALTH CHECK ---
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Quiz Bot is running!"
+
+# Function to start Flask in a separate thread
+def start_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # --- Set up logging ---
 logging.basicConfig(
@@ -799,4 +813,5 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+
      main()
