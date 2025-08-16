@@ -293,7 +293,7 @@ I Review your `chess\\.com` games right here in Telegram\\.
         {'duration': 14, 'price': 14, 'text': '2 Weeks'},
         {'duration': 7, 'price': 7, 'text': '1 Week'}
     ]
-    dynamic_durations = [2, 3, 4, 5, 8, 9, 10, 11, 12, 13]
+    dynamic_durations = [2, 3, 4, 5, ,6, 8, 9, 10, 11, 12, 13]
 
     for plan in default_plans:
         keyboard.append([InlineKeyboardButton(f"🛒 Buy {plan['text']} ({plan['duration']} Days) - ₹{plan['price']}", callback_data=f"buy_{plan['duration']}_days")])
@@ -301,7 +301,7 @@ I Review your `chess\\.com` games right here in Telegram\\.
     for duration in dynamic_durations:
         if get_available_credential(duration):
             price = duration
-            keyboard.append([InlineKeyboardButton(f"🛒 Buy {duration} Days - ₹{price}", callback_data=f"buy_{duration}_days")])
+            keyboard.append([InlineKeyboardButton(f"🛒 Buy {duration} Days - ₹{price*2}", callback_data=f"buy_{duration}_days")])
 
     if keyboard:
         keyboard.append([InlineKeyboardButton("ℹ️ My Details", callback_data="my_details")])
@@ -349,13 +349,13 @@ async def handle_buy_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
     
     if duration == 7:
-        price = 7
+        price = 7*2
         text = "1 Week"
     elif duration == 14:
-        price = 14
+        price = 14*2
         text = "2 Weeks"
     else:
-        price = duration
+        price = duration*2
         text = f"{duration} Days"
         
     selected_plan = {"price": price, "duration": duration, "text": text}
