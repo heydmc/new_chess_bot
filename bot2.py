@@ -293,7 +293,7 @@ I Review your `chess\\.com` games right here in Telegram\\.
         {'duration': 14, 'price': 14, 'text': '2 Weeks'},
         {'duration': 7, 'price': 7, 'text': '1 Week'}
     ]
-    dynamic_durations = [2, 3, 4, 5, ,6, 8, 9, 10, 11, 12, 13]
+    dynamic_durations = [2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]
 
     for plan in default_plans:
         keyboard.append([InlineKeyboardButton(f"🛒 Buy {plan['text']} ({plan['duration']} Days) - ₹{plan['price']}", callback_data=f"buy_{plan['duration']}_days")])
