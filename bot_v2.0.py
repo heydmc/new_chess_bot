@@ -1,12 +1,15 @@
 import logging
 import re
 import os
-import sqlite3
 import asyncio
+import json
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
-from flask import Flask  
-import threading #also needed by flask
+
+# --- Firebase Admin SDK ---
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
@@ -26,234 +29,232 @@ load_dotenv()
 # --- Configuration ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USERID = os.getenv("ADMIN_USERID")
-DB_FILE = "user_data.db"
-UPI_NUMBER = "6372833479@ptsbi"
+UPI_NUMBER = "6372833479"
 UPI_NAME = "Durgamadhav Pati"
 
+# --- Firebase Initialization ---
+try:
+    # For Render deployment, get credentials from the secret file
+    if os.path.exists('firebase_credentials.json'):
+        cred = credentials.Certificate('firebase_credentials.json')
+    # For local development, get credentials from the env variable
+    else:
+        firebase_creds_json = os.getenv('FIREBASE_CREDENTIALS_JSON')
+        if not firebase_creds_json:
+            raise ValueError("FIREBASE_CREDENTIALS_JSON environment variable not set.")
+        firebase_creds_dict = json.loads(firebase_creds_json)
+        cred = credentials.Certificate(firebase_creds_dict)
 
-
-# --- FLASK APP FOR RENDER HEALTH CHECK ---
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Quiz Bot is running!"
-
-# Function to start Flask in a separate thread
-def start_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger = logging.getLogger(__name__)
+    logger.info("Successfully connected to Firestore.")
+except Exception as e:
+    logging.critical(f"!!! ERROR: Failed to initialize Firebase: {e} !!!")
+    exit()
 
 
 # --- Set up logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- Database Functions ---
+# --- Firestore Collection References ---
+users_ref = db.collection('users')
+credentials_ref = db.collection('credentials')
 
-def init_db():
-    """Initializes the database and creates/updates tables."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        # Create users table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                is_bot_use BOOLEAN NOT NULL DEFAULT 0,
-                plan_expiry_date DATETIME,
-                assigned_username TEXT,
-                assigned_password TEXT
-            )
-        """)
-        # Create credentials table for the pool
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS credentials (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'available', -- available, in_use
-                credential_expiry_date DATETIME
-            )
-        """)
-        # Compatibility checks for old schemas
-        try:
-            cursor.execute("ALTER TABLE credentials ADD COLUMN credential_expiry_date DATETIME")
-        except sqlite3.OperationalError:
-            pass # Column already exists
-        try:
-            cursor.execute("ALTER TABLE users RENAME COLUMN chess_username TO assigned_username")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            cursor.execute("ALTER TABLE users ADD COLUMN assigned_password TEXT")
-        except sqlite3.OperationalError:
-            pass
-        conn.commit()
-
+# --- Database Functions (Firestore Version) ---
 
 def get_user(user_id: int):
-    """Retrieves a user from the database."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
+    """Retrieves a user document from Firestore."""
+    try:
+        doc = users_ref.document(str(user_id)).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting user {user_id}: {e}")
+        return None
 
 def get_credential(username: str):
-    """Retrieves a specific credential from the pool."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM credentials WHERE username = ?", (username,))
-        return cursor.fetchone()
+    """Retrieves a specific credential document from Firestore."""
+    try:
+        doc = credentials_ref.document(username).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting credential {username}: {e}")
+        return None
 
 def add_or_get_user(user_id: int):
     """Adds a new user if they don't exist, then returns their data."""
     user = get_user(user_id)
     if not user:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-            conn.commit()
-        logger.info(f"New user created in DB with ID: {user_id}")
-        return get_user(user_id)
+        try:
+            user_data = {
+                'user_id': user_id,
+                'is_bot_use': False,
+                'plan_expiry_date': None,
+                'assigned_username': None,
+                'assigned_password': None
+            }
+            users_ref.document(str(user_id)).set(user_data)
+            logger.info(f"New user created in Firestore with ID: {user_id}")
+            return user_data
+        except Exception as e:
+            logger.error(f"Error creating user {user_id}: {e}")
+            return None
     return user
 
 def add_credential_to_pool(username, password, days):
     """Adds a new credential to the pool with an expiry date."""
+    if get_credential(username):
+        logger.warning(f"Attempted to add duplicate username to credential pool: {username}")
+        return False
+    
     expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                "INSERT INTO credentials (username, password, status, credential_expiry_date) VALUES (?, ?, 'available', ?)",
-                (username, password, expiry_date)
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            logger.warning(f"Attempted to add duplicate username to credential pool: {username}")
-            return False
+    try:
+        cred_data = {
+            'username': username,
+            'password': password,
+            'status': 'available',
+            'credential_expiry_date': expiry_date
+        }
+        credentials_ref.document(username).set(cred_data)
+        return True
+    except Exception as e:
+        logger.error(f"Error adding credential {username}: {e}")
+        return False
 
 def edit_credential_in_pool(username, new_password, new_days):
     """Edits an existing credential in the pool."""
-    new_expiry_date = datetime.now(timezone.utc) + timedelta(days=new_days)
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        # Check if the credential exists first
-        cursor.execute("SELECT id FROM credentials WHERE username = ?", (username,))
-        if cursor.fetchone() is None:
-            return False # Credential doesn't exist
+    if not get_credential(username):
+        return False
         
-        cursor.execute(
-            "UPDATE credentials SET password = ?, credential_expiry_date = ? WHERE username = ?",
-            (new_password, new_expiry_date, username)
-        )
-        conn.commit()
+    new_expiry_date = datetime.now(timezone.utc) + timedelta(days=new_days)
+    try:
+        credentials_ref.document(username).update({
+            'password': new_password,
+            'credential_expiry_date': new_expiry_date
+        })
         return True
+    except Exception as e:
+        logger.error(f"Error editing credential {username}: {e}")
+        return False
 
 def get_available_credential(required_days: int):
     """Gets the soonest-expiring credential that can last for the required duration."""
     required_expiry_date = datetime.now(timezone.utc) + timedelta(days=required_days)
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM credentials 
-            WHERE status = 'available' AND credential_expiry_date >= ? 
-            ORDER BY credential_expiry_date ASC 
-            LIMIT 1
-            """,
-            (required_expiry_date,)
-        )
-        return cursor.fetchone()
+    try:
+        query = credentials_ref.where('status', '==', 'available') \
+                               .where('credential_expiry_date', '>=', required_expiry_date) \
+                               .order_by('credential_expiry_date') \
+                               .limit(1)
+        docs = query.stream()
+        for doc in docs:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting available credential: {e}")
+        return None
 
 def get_all_available_credentials():
     """Gets all available, non-expired credentials from the pool."""
     now = datetime.now(timezone.utc)
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT * FROM credentials
-            WHERE status = 'available' AND credential_expiry_date > ?
-            ORDER BY credential_expiry_date ASC
-            """,
-            (now,)
-        )
-        return cursor.fetchall()
+    try:
+        query = credentials_ref.where('status', '==', 'available') \
+                               .where('credential_expiry_date', '>', now) \
+                               .order_by('credential_expiry_date')
+        docs = query.stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception as e:
+        logger.error(f"Error getting all available credentials: {e}")
+        return []
 
 def get_all_used_credentials():
-    """Gets all 'in_use' credentials and the user they are assigned to."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT c.username, c.credential_expiry_date, u.user_id 
-            FROM credentials c
-            JOIN users u ON c.username = u.assigned_username
-            WHERE c.status = 'in_use'
-            """
-        )
-        return cursor.fetchall()
+    """Gets all 'in_use' credentials."""
+    try:
+        query = credentials_ref.where('status', '==', 'in_use')
+        docs = query.stream()
+        
+        # We need to find which user has the credential.
+        # This is less efficient in Firestore than a SQL JOIN.
+        used_creds_list = []
+        all_users = {doc.id: doc.to_dict() for doc in users_ref.stream()}
+
+        for cred_doc in docs:
+            cred_data = cred_doc.to_dict()
+            for user_id, user_data in all_users.items():
+                if user_data.get('assigned_username') == cred_data['username']:
+                    cred_data['user_id'] = user_id
+                    used_creds_list.append(cred_data)
+                    break
+        return used_creds_list
+    except Exception as e:
+        logger.error(f"Error getting all used credentials: {e}")
+        return []
 
 def update_credential_status(username, status):
     """Updates the status of a credential."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE credentials SET status = ? WHERE username = ?", (status, username))
-        conn.commit()
+    try:
+        credentials_ref.document(username).update({'status': status})
+    except Exception as e:
+        logger.error(f"Error updating status for {username}: {e}")
 
 def assign_credential_to_user(user_id, cred):
     """Assigns a credential to a user."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET assigned_username = ?, assigned_password = ? WHERE user_id = ?", (cred['username'], cred['password'], user_id))
-        conn.commit()
-    update_credential_status(cred['username'], 'in_use')
-    logger.info(f"Assigned credential {cred['username']} to user {user_id}")
+    try:
+        users_ref.document(str(user_id)).update({
+            'assigned_username': cred['username'],
+            'assigned_password': cred['password']
+        })
+        update_credential_status(cred['username'], 'in_use')
+        logger.info(f"Assigned credential {cred['username']} to user {user_id}")
+    except Exception as e:
+        logger.error(f"Error assigning credential to user {user_id}: {e}")
 
 def grant_user_access(user_id: int, days: int):
     """Grants a user plan access for a specific number of days."""
     expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET is_bot_use = 1, plan_expiry_date = ? WHERE user_id = ?",
-            (expiry_date, user_id)
-        )
-        conn.commit()
-    logger.info(f"Granted plan access to user {user_id} for {days} days. Expires on {expiry_date.isoformat()}")
+    try:
+        users_ref.document(str(user_id)).update({
+            'is_bot_use': True,
+            'plan_expiry_date': expiry_date
+        })
+        logger.info(f"Granted plan access to user {user_id} for {days} days. Expires on {expiry_date.isoformat()}")
+    except Exception as e:
+        logger.error(f"Error granting access to user {user_id}: {e}")
 
 def revoke_user_access(user_id: int):
     """Revokes a user's plan access."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET is_bot_use = 0, plan_expiry_date = NULL WHERE user_id = ?", (user_id,))
-        conn.commit()
-    logger.info(f"Revoked access for user {user_id}")
+    try:
+        users_ref.document(str(user_id)).update({
+            'is_bot_use': False,
+            'plan_expiry_date': None
+        })
+        logger.info(f"Revoked access for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error revoking access for user {user_id}: {e}")
 
 def free_credential_from_user(user_id: int):
     """Frees a credential from a user, making it available again."""
     user = get_user(user_id)
-    if not user or not user['assigned_username']:
-        return None # User has no credential assigned
+    if not user or not user.get('assigned_username'):
+        return None
     
     username_to_free = user['assigned_username']
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET assigned_username = NULL, assigned_password = NULL WHERE user_id = ?", (user_id,))
-        conn.commit()
-    update_credential_status(username_to_free, 'available')
-    logger.info(f"Freed credential {username_to_free} from user {user_id}")
-    return username_to_free
-
+    try:
+        users_ref.document(str(user_id)).update({
+            'assigned_username': None,
+            'assigned_password': None
+        })
+        update_credential_status(username_to_free, 'available')
+        logger.info(f"Freed credential {username_to_free} from user {user_id}")
+        return username_to_free
+    except Exception as e:
+        logger.error(f"Error freeing credential from user {user_id}: {e}")
+        return None
 
 # --- Conversation Handler States ---
 CHOOSING_PLAN, AWAITING_PAYMENT_CONFIRM, AWAITING_SCREENSHOT = range(3)
@@ -269,19 +270,14 @@ async def check_user_permission(update: Update, context: ContextTypes.DEFAULT_TY
     """Checks if a user is permitted to use the bot's core feature."""
     user_id = update.effective_user.id
     user_record = add_or_get_user(user_id)
-    return user_record['is_bot_use']
+    return user_record and user_record.get('is_bot_use', False)
 
 async def is_admin(user_id: int) -> bool:
     """Checks if the user is the admin."""
     return str(user_id) == ADMIN_USERID
 
-# --- Command Handlers ---
+# --- Command Handlers (No changes needed here) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handles the /start command.
-    NEW LOGIC: Fetches all available credentials, calculates their remaining full-day duration,
-    and creates a unique "buy" button for each duration.
-    """
     user = update.effective_user
     logger.info(f"User {user.first_name} ({user.id}) started the bot.")
     add_or_get_user(user.id)
@@ -289,33 +285,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     welcome_message = f"""
 *Welcome to Chess Review Bot*, {escaped_name}\\! 💎
 
-I Can Review your `chess\\.com` games right here in Telegram\\.
+I Review your `chess\\.com` games right here in Telegram\\.
 
 *To access this feature, you need an active plan\\. Choose one below to get started\\!*
     """
     
     keyboard = []
-    
-    # --- NEW DYNAMIC BUTTON LOGIC ---
     available_creds = get_all_available_credentials()
     now = datetime.now(timezone.utc)
-    durations_offered = set() # Use a set to avoid duplicate buttons (e.g., two 9-day creds)
+    durations_offered = set()
 
     if available_creds:
         for cred in available_creds:
-            expiry_date_str = cred['credential_expiry_date']
-            if isinstance(expiry_date_str, str):
-                expiry_date = datetime.fromisoformat(expiry_date_str).replace(tzinfo=timezone.utc)
-            else: # Already a datetime object
-                expiry_date = expiry_date_str.replace(tzinfo=timezone.utc)
+            expiry_date = cred['credential_expiry_date']
+            if isinstance(expiry_date, str):
+                expiry_date = datetime.fromisoformat(expiry_date).replace(tzinfo=timezone.utc)
+            else:
+                expiry_date = expiry_date.replace(tzinfo=timezone.utc)
 
             remaining_time = expiry_date - now
             
             if remaining_time.total_seconds() > 0:
-                # Calculate remaining time in whole days
                 remaining_days = remaining_time.days
-
-                # Only offer plans for 1 day or more and if not already offered
                 if remaining_days >= 1 and remaining_days not in durations_offered:
                     price = remaining_days * 2
                     keyboard.append([
@@ -326,7 +317,6 @@ I Can Review your `chess\\.com` games right here in Telegram\\.
                     ])
                     durations_offered.add(remaining_days)
 
-    # Sort buttons by duration for better user experience
     keyboard.sort(key=lambda row: int(row[0].callback_data.split('_')[1]))
 
     if keyboard:
@@ -363,11 +353,6 @@ async def handle_chess_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Please send a valid `chess\\.com` game link\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
 async def handle_buy_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handles the plan purchase callback.
-    UPDATED: Now sends a photo (QR code) with the payment details in the caption.
-    FIXED: Correctly gets chat_id from query.message.chat_id.
-    """
     query = update.callback_query
     await query.answer()
     
@@ -394,17 +379,14 @@ async def handle_buy_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data['plan'] = selected_plan
     escaped_upi_name = escape_markdown(UPI_NAME)
-
-    # !!! IMPORTANT: Replace this placeholder with a direct public URL to your QR code image !!!
     QR_CODE_IMAGE_URL = "https://friendsacademy.my.canva.site/dagw9ggpkzi/_assets/media/1c746d47e89f5e0e2872135c5c337088.png" 
+ # Replace with your QR code URL
 
     payment_caption = f"""
 *You have selected the {selected_plan['text']} plan for ₹{selected_plan['price']}\\.*
-
 Please pay the amount to the following UPI ID or by scanning the QR code:
 `{UPI_NUMBER}`
 Name: *{escaped_upi_name}*
-
 Once paid, please press the button below\\.
     """
     keyboard = [
@@ -412,36 +394,25 @@ Once paid, please press the button below\\.
         [InlineKeyboardButton("❌ Cancel Order", callback_data="cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Since we are changing the message type from text to photo,
-    # we delete the old message and send a new one.
     await query.message.delete()
     await context.bot.send_photo(
-        chat_id=query.message.chat_id, # <-- THIS IS THE FIX
+        chat_id=query.message.chat_id,
         photo=QR_CODE_IMAGE_URL,
         caption=payment_caption,
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN_V2
     )
-
     return AWAITING_PAYMENT_CONFIRM
-
 
 async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-
-    # First, edit the photo message to remove the "Paid" and "Cancel" buttons.
-    # This prevents the user from clicking them again.
     await query.edit_message_reply_markup(reply_markup=None)
-
-    # Then, send a new message to the user.
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="Thank you😊💎\\! Please send me the SCREENSHOT📲 of your payment for verification✅\\.",
+        text="Thank you\\! Please send me the screenshot of your payment for verification\\.",
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    
     return AWAITING_SCREENSHOT
 
 async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -473,7 +444,7 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.send_photo(chat_id=ADMIN_USERID, photo=update.message.photo[-1].file_id, caption=plain_text_caption)
         await context.bot.send_message(chat_id=ADMIN_USERID, text=permit_command)
     
-    await update.message.reply_text("Thank you😊😎\\! Your order is being verified✅🤖\\. You'll be notified once access is granted💎\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text("Thank you\\! Your order is being verified\\. You'll be notified once access is granted\\.", parse_mode=ParseMode.MARKDOWN_V2)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -481,6 +452,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     query = update.callback_query
     await query.answer()
     context.user_data.clear()
+    await query.message.delete()
     return await start(update, context)
 
 async def my_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -491,24 +463,22 @@ async def my_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     user_id = update.effective_user.id
     user_record = get_user(user_id)
-
-       # --- NEW: Check for an active plan ---
+    
     if not user_record or not user_record['is_bot_use']:
         await base_message.reply_text(
             text="You do not have an active plan\\. Please use /start to purchase one\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
         return CHOOSING_PLAN
+
+    username = escape_markdown(user_record.get('assigned_username', "Not set"))
+    password = escape_markdown(user_record.get('assigned_password', "Not set"))
     
-    username = escape_markdown(user_record['assigned_username'] if user_record and user_record['assigned_username'] else "Not set")
-    password = escape_markdown(user_record['assigned_password'] if user_record and user_record['assigned_password'] else "Not set")
-    
-    expiry_date = user_record['plan_expiry_date'] if user_record and user_record['plan_expiry_date'] else None
+    expiry_date = user_record.get('plan_expiry_date')
     
     if expiry_date:
         if isinstance(expiry_date, str):
             expiry_date = datetime.fromisoformat(expiry_date)
-        expiry_date = expiry_date.replace(tzinfo=timezone.utc)
         local_tz = timezone(timedelta(hours=5, minutes=30)) # IST
         expiry_local_str = escape_markdown(expiry_date.astimezone(local_tz).strftime("%d %b %Y, %I:%M %p"))
         expiry_text = f"*Plan Expires:* `{expiry_local_str}`"
@@ -517,59 +487,40 @@ async def my_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     details_message_text = f"""
 *Your Details* ℹ️
-
 *Chess\\.com Username:* `{username}`
 *Chess\\.com Password:* `{password}`
 {expiry_text}
-
 🔴This message will disappear in 10 seconds \\.
 Please REMEBER✅ your USERNAME and PASSWORD🧩\\.
 Or Just Take a Screenshot📲 of this message\\.
-
     """
-    # --- NEW: Create the inline keyboard with the login button ---
     keyboard = [
-        [InlineKeyboardButton("➡️ Log In to Chess.com",web_app=WebAppInfo(url="https://www.chess.com/login_and_go"))]
+        [InlineKeyboardButton("➡️ Log In to Chess.com", web_app=WebAppInfo(url="https://www.chess.com/login_and_go"))]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     sent_message = await base_message.reply_text(
         text=details_message_text,
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=reply_markup  # --- NEW: Add the keyboard to the message ---
+        reply_markup=reply_markup
     )
-    
-    
-
     await asyncio.sleep(10)
-
     try:
         await sent_message.delete()
         if update.message:
             await update.message.delete()
-    except BadRequest as e:
-        if "Message to delete not found" in str(e):
-            logger.info("Message for /mydetails was already deleted by user.")
-        else:
-            logger.error(f"Error deleting /mydetails message: {e}")
-    
+    except BadRequest:
+        pass
     return CHOOSING_PLAN
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles the /help command.
-    UPDATED: Commands are now plain text to be auto-linked by Telegram for "insert on tap" functionality.
-    """
     user_id = update.effective_user.id
-    
     user_commands = """
 *User Commands* 🤖
 /start \\- Start the bot & see plans
 /mydetails \\- See your assigned credentials
 /help \\- Show this help message
     """
-    
     admin_commands = """
 *Admin Commands* 👑
 /addcredential `<user> <pass> <days>` \\- Add a new credential to the pool
@@ -581,15 +532,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /freecredential `<id>` \\- Free a credential from a user
 /seedetails `<id>` \\- See all details for a specific user
     """
-    
     if await is_admin(user_id):
         help_text = user_commands + "\n" + admin_commands
     else:
         help_text = user_commands
-        
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN_V2)
 
-# --- Admin Commands ---
+# --- Admin Commands (No changes needed here, they use the new DB functions) ---
 async def add_credential(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_admin(update.effective_user.id): return
     if len(context.args) != 3:
@@ -624,76 +573,54 @@ async def edit_credential(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def see_available_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_admin(update.effective_user.id): return
-
     creds = get_all_available_credentials()
     if not creds:
         await update.message.reply_text("No available credentials in the pool\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
-
     now = datetime.now(timezone.utc)
     message_lines = ["*Available Credentials* 🕵️\n"]
-
     for cred in creds:
         username = escape_markdown(cred['username'])
         expiry_date = cred['credential_expiry_date']
-
         if isinstance(expiry_date, str):
             expiry_date = datetime.fromisoformat(expiry_date)
         expiry_date = expiry_date.replace(tzinfo=timezone.utc)
-
         remaining_time = expiry_date - now
         days = remaining_time.days
         hours = remaining_time.seconds // 3600
-        
         lifetime_str = f"{days} days, {hours} hours"
-        
         message_lines.append(f"• `{username}` \\- Expires in: {lifetime_str}")
-
     await update.message.reply_text("\n".join(message_lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def see_used_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_admin(update.effective_user.id): return
-
     creds = get_all_used_credentials()
     if not creds:
         await update.message.reply_text("No credentials are currently in use\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
-
     now = datetime.now(timezone.utc)
     message_lines = ["*Used Credentials* 🕵️\n"]
-
     for cred in creds:
         username = escape_markdown(cred['username'])
-        user_id = escape_markdown(str(cred['user_id']))
+        user_id = escape_markdown(str(cred.get('user_id', 'N/A')))
         expiry_date = cred['credential_expiry_date']
-
         if isinstance(expiry_date, str):
             expiry_date = datetime.fromisoformat(expiry_date)
         expiry_date = expiry_date.replace(tzinfo=timezone.utc)
-
         remaining_time = expiry_date - now
-        
         if remaining_time.total_seconds() < 0:
             lifetime_str = "Expired"
         else:
             days = remaining_time.days
             hours = remaining_time.seconds // 3600
             lifetime_str = f"{days} days, {hours} hours"
-        
         message_lines.append(f"• `{username}` \\- Assigned to: `{user_id}` \\- Expires in: {lifetime_str}")
-
     await update.message.reply_text("\n".join(message_lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def run_cleanup_task_after_delay(context: ContextTypes.DEFAULT_TYPE, user_id: int, delay_seconds: int):
-    """
-    An asynchronous task that waits for a specified delay, then runs the cleanup.
-    """
     logger.info(f"Starting background cleanup task for user {user_id}. Will run in {delay_seconds} seconds.")
-    
     await asyncio.sleep(delay_seconds)
-    
     logger.info(f"Executing scheduled cleanup for user_id: {user_id}")
-    
     try:
         freed_username = free_credential_from_user(user_id)
         if freed_username:
@@ -710,8 +637,7 @@ async def run_cleanup_task_after_delay(context: ContextTypes.DEFAULT_TYPE, user_
                 parse_mode=ParseMode.MARKDOWN_V2
             )
         else:
-            # This case handles if the user's plan expires but their credential was manually freed earlier
-            revoke_user_access(user_id) # Ensure access is revoked even if no credential
+            revoke_user_access(user_id)
             await context.bot.send_message(
                 chat_id=ADMIN_USERID,
                 text=f"🔔 *Plan Expired Notification* 🔔\n\nThe plan for user `{user_id}` has ended\\. Automatic cleanup was skipped as they had no credential assigned\\. Their access has been revoked.",
@@ -752,16 +678,13 @@ async def permit_bot_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"🤖 *Automated cleanup task has been started in the background\\.*",
             parse_mode=ParseMode.MARKDOWN_V2
         )
-        
         await context.bot.send_message(
             chat_id=target_user_id, 
             text=f"🎉 Congratulations\\! Your access has been granted for *{days_to_grant} days*\\. You can now send me chess links\\. Use /mydetails to see your assigned login\\.", 
             parse_mode=ParseMode.MARKDOWN_V2
         )
-
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: `/permitbotuse <user_id> <days>`\nExample: `/permitbotuse 1234567 14`", parse_mode=ParseMode.MARKDOWN_V2)
-
 
 async def restrict_bot_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_admin(update.effective_user.id): return
@@ -801,15 +724,14 @@ async def see_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         user_id_str = escape_markdown(str(user_record['user_id']))
-        assigned_username = user_record['assigned_username']
-        password = escape_markdown(user_record['assigned_password'] or "None")
-        is_active = "Yes" if user_record['is_bot_use'] else "No"
+        assigned_username = user_record.get('assigned_username')
+        password = escape_markdown(user_record.get('assigned_password', "None"))
+        is_active = "Yes" if user_record.get('is_bot_use') else "No"
         
-        plan_expiry_date = user_record['plan_expiry_date']
+        plan_expiry_date = user_record.get('plan_expiry_date')
         if plan_expiry_date:
             if isinstance(plan_expiry_date, str):
                 plan_expiry_date = datetime.fromisoformat(plan_expiry_date)
-            plan_expiry_date = plan_expiry_date.replace(tzinfo=timezone.utc)
             local_tz = timezone(timedelta(hours=5, minutes=30)) # IST
             plan_expiry_str = escape_markdown(plan_expiry_date.astimezone(local_tz).strftime("%d %b %Y, %I:%M %p"))
             plan_expiry_text = f"`{plan_expiry_str}`"
@@ -819,46 +741,32 @@ async def see_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         cred_expiry_text = "`N/A`"
         if assigned_username:
             cred_record = get_credential(assigned_username)
-            if cred_record and cred_record['credential_expiry_date']:
+            if cred_record and cred_record.get('credential_expiry_date'):
                 cred_expiry_date = cred_record['credential_expiry_date']
                 if isinstance(cred_expiry_date, str):
                     cred_expiry_date = datetime.fromisoformat(cred_expiry_date)
-                cred_expiry_date = cred_expiry_date.replace(tzinfo=timezone.utc)
                 local_tz = timezone(timedelta(hours=5, minutes=30)) # IST
                 cred_expiry_str = escape_markdown(cred_expiry_date.astimezone(local_tz).strftime("%d %b %Y, %I:%M %p"))
                 cred_expiry_text = f"`{cred_expiry_str}`"
 
         details_message = f"""
 *Admin Details for User* 🕵️
-
 *User ID:* `{user_id_str}`
 *Plan Active:* {is_active}
 *Plan Expires:* {plan_expiry_text}
-
 *Assigned Username:* `{escape_markdown(assigned_username or "None")}`
 *Assigned Password:* `{password}`
 *Credential Expires:* {cred_expiry_text}
         """
         await update.message.reply_text(details_message, parse_mode=ParseMode.MARKDOWN_V2)
-
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /seedetails <user_id>")
 
-
 def main() -> None:
-    """Start Flask in a thread and the bot using polling."""
-    # Start Flask server in a background thread
-    threading.Thread(target=start_flask, daemon=True).start()
-
-
-
-    
     """The main function to start the bot."""
     if not BOT_TOKEN or not ADMIN_USERID:
-        logger.critical("!!! ERROR: TELEGRAM_BOT_TOKEN or ADMIN_USERID not found in .env file. !!!")
+        logger.critical("!!! ERROR: TELEGRAM_BOT_TOKEN or ADMIN_USERID not found. !!!")
         return
-
-    init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -878,7 +786,6 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("mydetails", my_details))
     application.add_handler(CommandHandler("help", help_command))
-    # Admin commands
     application.add_handler(CommandHandler("addcredential", add_credential))
     application.add_handler(CommandHandler("editcredential", edit_credential))
     application.add_handler(CommandHandler("availablecreds", see_available_credentials))
@@ -887,13 +794,10 @@ def main() -> None:
     application.add_handler(CommandHandler("restrictbotuse", restrict_bot_use))
     application.add_handler(CommandHandler("freecredential", free_credential))
     application.add_handler(CommandHandler("seedetails", see_details))
-    # Regular message handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chess_link))
 
-    logger.info("Bot is running...")
+    logger.info("Bot is running with Firestore backend...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-
-
