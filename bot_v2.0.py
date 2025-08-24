@@ -26,9 +26,35 @@ load_dotenv()
 # --- Configuration ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USERID = os.getenv("ADMIN_USERID")
-DB_FILE = "user_data.db"
 UPI_NUMBER = "6372833479@ptsbi"
 UPI_NAME = "Durgamadhav Pati"
+
+
+# --- Firebase Initialization ---
+try:
+    # For Render deployment, get credentials from the secret file
+    if os.path.exists('firebase_credentials.json'):
+        cred = credentials.Certificate('firebase_credentials.json')
+    # For local development, get credentials from the env variable
+    else:
+        firebase_creds_json = os.getenv('FIREBASE_CREDENTIALS_JSON')
+        if not firebase_creds_json:
+            raise ValueError("FIREBASE_CREDENTIALS_JSON environment variable not set.")
+        firebase_creds_dict = json.loads(firebase_creds_json)
+        cred = credentials.Certificate(firebase_creds_dict)
+
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger = logging.getLogger(__name__)
+    logger.info("Successfully connected to Firestore.")
+except Exception as e:
+    logging.critical(f"!!! ERROR: Failed to initialize Firebase: {e} !!!")
+    exit()
+
+
+
+
+
 
 
 
@@ -50,65 +76,36 @@ def start_flask():
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# --- Database Functions ---
+ # --- Firestore Collection References ---
+users_ref = db.collection('users')
+credentials_ref = db.collection('credentials')
 
-def init_db():
-    """Initializes the database and creates/updates tables."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        # Create users table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                is_bot_use BOOLEAN NOT NULL DEFAULT 0,
-                plan_expiry_date DATETIME,
-                assigned_username TEXT,
-                assigned_password TEXT
-            )
-        """)
-        # Create credentials table for the pool
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS credentials (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'available', -- available, in_use
-                credential_expiry_date DATETIME
-            )
-        """)
-        # Compatibility checks for old schemas
-        try:
-            cursor.execute("ALTER TABLE credentials ADD COLUMN credential_expiry_date DATETIME")
-        except sqlite3.OperationalError:
-            pass # Column already exists
-        try:
-            cursor.execute("ALTER TABLE users RENAME COLUMN chess_username TO assigned_username")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            cursor.execute("ALTER TABLE users ADD COLUMN assigned_password TEXT")
-        except sqlite3.OperationalError:
-            pass
-        conn.commit()
-
+# --- Database Functions (Firestore Version) ---
 
 def get_user(user_id: int):
-    """Retrieves a user from the database."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
+     """Retrieves a user document from Firestore."""
+    try:
+        doc = users_ref.document(str(user_id)).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting user {user_id}: {e}")
+        return None
+
+
 
 def get_credential(username: str):
-    """Retrieves a specific credential from the pool."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM credentials WHERE username = ?", (username,))
-        return cursor.fetchone()
+    """Retrieves a specific credential document from Firestore."""
+    try:
+        doc = credentials_ref.document(username).get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        logger.error(f"Error getting credential {username}: {e}")
+        return None
 
 def add_or_get_user(user_id: int):
     """Adds a new user if they don't exist, then returns their data."""
@@ -895,5 +892,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
