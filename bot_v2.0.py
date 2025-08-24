@@ -5,7 +5,7 @@ import sqlite3
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
-
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
@@ -28,6 +28,22 @@ ADMIN_USERID = os.getenv("ADMIN_USERID")
 DB_FILE = "user_data.db"
 UPI_NUMBER = "6372833479@ptsbi"
 UPI_NAME = "Durgamadhav Pati"
+
+
+
+# --- FLASK APP FOR RENDER HEALTH CHECK ---
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Quiz Bot is running!"
+
+# Function to start Flask in a separate thread
+def start_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
 
 # --- Set up logging ---
 logging.basicConfig(
@@ -829,6 +845,13 @@ async def see_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def main() -> None:
+    """Start Flask in a thread and the bot using polling."""
+    # Start Flask server in a background thread
+    threading.Thread(target=start_flask, daemon=True).start()
+
+
+
+    
     """The main function to start the bot."""
     if not BOT_TOKEN or not ADMIN_USERID:
         logger.critical("!!! ERROR: TELEGRAM_BOT_TOKEN or ADMIN_USERID not found in .env file. !!!")
@@ -871,3 +894,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
