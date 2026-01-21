@@ -303,17 +303,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     add_or_get_user(user.id)
     escaped_name = escape_markdown(user.first_name)
     # Store the long link in a variable to keep the f-string clean
-tutorial_url = "https://www.canva.com/design/DAGw52ztILg/p5XerEuXDnv1eZ-pM4gPsw/watch?utm_content=DAGw52ztILg&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=h8ce7f0cadd"
+    tutorial_url = "https://www.canva.com/design/DAGw52ztILg/p5XerEuXDnv1eZ-pM4gPsw/watch?utm_content=DAGw52ztILg&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=h8ce7f0cadd"
 
-welcome_message = f"""
-*Welcome to Chess Review Bot*, {escaped_name}\\! 💎
+    welcome_message = f"""
+    *Welcome to Chess Review Bot*, {escaped_name}\\! 💎
 
-I Review your `chess\\.com` games right here in Telegram\\.
+    I Review your `chess\\.com` games right here in Telegram\\.
 
-[Click here to watch the tutorial how to use the BOT]({tutorial_url})
+    [Click here to watch the tutorial how to use the BOT]({tutorial_url})
 
-*To access this feature, you need an active plan\\. Choose one below to get started\\!*
-"""
+    *To access this feature, you need an active plan\\. Choose one below to get started\\!*
+    """
     
     keyboard = []
     available_creds = get_all_available_credentials()
