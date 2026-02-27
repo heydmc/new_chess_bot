@@ -559,8 +559,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /seedetails `<id>` \\- See all details for a specific user
 /message `<id> <text>` \- Send a direct message to a user
     """
+    version = """version\=4\.1"""
     if await is_admin(user_id):
-        help_text = user_commands + "\n" + admin_commands
+        help_text = user_commands + "\n" + admin_commands + "\n" + version
     else:
         help_text = user_commands
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN_V2)
