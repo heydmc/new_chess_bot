@@ -816,10 +816,10 @@ async def send_message_to_user(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=ParseMode.MARKDOWN_V2
             )
             return
-
+        admin_handle = "@Hey\_DMC"
         await context.bot.send_message(
             chat_id=target_user_id,
-            text=f"✉️ *Message from Admin:*\n\n{escape_markdown(message_to_send)} \n\nContact Admin @Hey\_DMC",
+            text=f"✉️ *Message from Admin:*\n\n{escape_markdown(message_to_send)} \n\nContact Admin {admin_handle}",
             parse_mode=ParseMode.MARKDOWN_V2
         )
         
